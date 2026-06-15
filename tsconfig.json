@@ -8,6 +8,7 @@
     "skipLibCheck": true,
     "lib": ["ES2022"],
     "types": ["node"],
+    "jsx": "react-jsx",
     "outDir": "dist",
     "rootDir": "src",
     "resolveJsonModule": true,

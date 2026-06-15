@@ -1,14 +1,16 @@
-import pc from "picocolors";
+export type PermAnswer = "yes" | "no" | "always";
 
-export type Ask = (question: string) => Promise<string>;
+/** Asks the UI for a decision on a dangerous action. */
+export type PermissionRequester = (summary: string) => Promise<PermAnswer>;
 
 /**
- * Gates dangerous tool calls behind an interactive prompt, remembering
- * "always" approvals for the rest of the session.
+ * Gates dangerous tool calls behind a UI prompt, remembering "always"
+ * approvals for the rest of the session. UI-agnostic: the requester is wired
+ * at startup (Ink store, or a readline prompt in headless mode).
  */
 export class PermissionManager {
   private allowed = new Set<string>();
-  private ask: Ask | null = null;
+  private requester: PermissionRequester | null = null;
 
   constructor(private skipAll: boolean) {}
 
@@ -16,9 +18,8 @@ export class PermissionManager {
     this.skipAll = value;
   }
 
-  /** Wire up the shared readline prompt once the REPL owns it. */
-  setAsk(ask: Ask): void {
-    this.ask = ask;
+  setRequester(requester: PermissionRequester): void {
+    this.requester = requester;
   }
 
   /**
@@ -28,21 +29,13 @@ export class PermissionManager {
   async check(key: string, summary: string): Promise<boolean> {
     if (this.skipAll) return true;
     if (this.allowed.has(key)) return true;
-    if (!this.ask) return false;
+    if (!this.requester) return false;
 
-    process.stdout.write(
-      pc.yellow("\n  permission required: ") + pc.bold(summary) + "\n"
-    );
-    const answer = (
-      await this.ask(pc.dim("  allow? [y]es / [n]o / [a]lways this kind: "))
-    )
-      .trim()
-      .toLowerCase();
-
-    if (answer === "a" || answer === "always") {
+    const answer = await this.requester(summary);
+    if (answer === "always") {
       this.allowed.add(key);
       return true;
     }
-    return answer === "y" || answer === "yes";
+    return answer === "yes";
   }
 }

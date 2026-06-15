@@ -1,4 +1,4 @@
-# iota
+# iota 🤖
 
 A terminal-based coding harness in the spirit of Claude Code, built on
 [**Mastra**](https://mastra.ai). A REPL where you talk to an agent that can read
@@ -50,22 +50,30 @@ the agent):
 | `/help` | List commands. |
 | `/tools` | List all available tools (built-in + MCP). |
 | `/mcp` | List connected MCP servers and their tools (with status). |
-| `exit` / `quit` | Quit (also Ctrl-D / Ctrl-C at the prompt). |
+| `/jobs` | List background shells (running/exited) and their commands. |
+| `/quit` | Quit (aliases: `/exit`, `/q`, `exit`, `quit`; also Ctrl-D / Ctrl-C at the prompt). |
 
 ## How it works
 
 ```
-repl ──▶ Mastra Agent ──▶ model router (Anthropic | OpenAI)
-              │   ├─ tools: read/write/edit/bash/grep/glob/ls  (createTool)
-              │   └─ Memory (LibSQL) ── history + working memory, persisted
-              └─ tools gate write/edit/bash through the permission prompt
+Ink TUI ──▶ session ──▶ Mastra Agent ──▶ model router (Anthropic | OpenAI)
+  ▲           │              ├─ tools: read/write/edit/bash/grep/glob/ls (createTool)
+  │           │              └─ Memory (LibSQL) ── history + working memory, persisted
+  └─ store ◀──┘              tools gate write/edit/bash through the permission prompt
 ```
 
-The REPL calls `agent.stream(input, { memory: { resource, thread } })` and pipes
-`textStream` to the terminal. Mastra runs the tool-call loop itself; each tool is
-a `createTool` definition (`src/tools.ts`). Tools reach the working directory and
-the permission prompt through a small module-level `runtime` singleton, since
+The UI is a React **[Ink](https://github.com/vadimdemedes/ink)** app rendering from
+a central **store** (`src/ui/store.ts`). The `session` controller calls
+`agent.stream(...)` and feeds deltas into the store; finalized assistant messages
+re-render as **markdown** (with syntax-highlighted code) in Ink's `<Static>`, while
+the live turn streams below with a spinner. Tools, the permission prompt, and slash
+commands all push state into the store rather than printing — so spinners, the input
+box, and live output never clobber each other. Tools reach the working directory,
+the permission prompt, and the UI through a module-level `runtime` singleton, since
 Mastra only hands tools their validated input.
+
+When stdin isn't a TTY (pipes/CI), iota falls back to a plain-text runner with the
+same agent/commands (so `printf 'hi\n' | iota` still works).
 
 ## Memory
 
@@ -102,9 +110,23 @@ The banner prints which files were loaded. Put repo-wide conventions in an
 
 ## Tools
 
-`read`, `write`, `edit`, `bash`, `grep` (uses ripgrep if installed), `glob`, `ls`.
-`write`, `edit`, and `bash` prompt for permission unless `--yolo` is set; answer
-`a` to allow that kind of action for the rest of the session.
+`read`, `write`, `edit`, `bash`, `bash_output`, `kill_shell`, `grep` (uses ripgrep
+if installed), `glob`, `ls`. `write`, `edit`, and `bash` prompt for permission
+unless `--yolo` is set; answer `a` to allow that kind of action for the rest of the
+session.
+
+### Background shells
+
+`bash` runs commands in the foreground by default (waits, returns output, 120s
+timeout). For long-running commands (dev servers, watchers, builds), the agent can
+call `bash` with `background: true` — it starts detached and returns a `bash_id`
+immediately (no timeout). The agent then:
+
+- `bash_output(bash_id)` — read new output since the last poll, plus status;
+- `kill_shell(bash_id)` — stop it.
+
+Running shells show as `▸ N bg` in the status bar; `/jobs` lists them. All
+background shells are killed when iota exits.
 
 ## MCP servers
 

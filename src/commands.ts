@@ -1,77 +1,86 @@
-import pc from "picocolors";
 import { tools as builtinTools } from "./tools.js";
+import { listShells } from "./shells.js";
 import type { McpServerInfo } from "./mcp.js";
+import type { SystemOutput } from "./ui/store.js";
 
 /** State the slash commands can read. */
 export interface CommandContext {
   mcpServers: McpServerInfo[];
 }
 
-const HELP: Array<[string, string]> = [
-  ["/help", "show this help"],
-  ["/tools", "list all available tools (built-in + MCP)"],
-  ["/mcp", "list connected MCP servers and their tools"],
-  ["exit", "quit iota"],
-];
+export type CommandResult =
+  | { action: "passthrough" }
+  | { action: "quit" }
+  | { action: "handled"; output: SystemOutput };
 
-/**
- * Handle a slash command. Returns true if the input was a command (and should
- * not be sent to the agent), false otherwise.
- */
-export function runCommand(input: string, ctx: CommandContext): boolean {
-  if (!input.startsWith("/")) return false;
+const HELP_BODY = [
+  "/help    show this help",
+  "/tools   list all available tools (built-in + MCP)",
+  "/mcp     list connected MCP servers and their tools",
+  "/jobs    list background shells",
+  "/quit    quit iota (aliases: /exit, /q, exit, quit)",
+].join("\n");
+
+/** Handle a slash command. Non-slash input returns `passthrough`. */
+export function runCommand(input: string, ctx: CommandContext): CommandResult {
+  if (!input.startsWith("/")) return { action: "passthrough" };
   const [cmd] = input.slice(1).trim().split(/\s+/);
   switch (cmd) {
     case "help":
-      printHelp();
-      return true;
+      return { action: "handled", output: { title: "commands", body: HELP_BODY } };
     case "tools":
-      printTools(ctx);
-      return true;
+      return { action: "handled", output: { title: "tools", body: toolsBody(ctx) } };
     case "mcp":
-      printMcp(ctx);
-      return true;
+      return { action: "handled", output: { title: "mcp servers", body: mcpBody(ctx) } };
+    case "jobs":
+    case "shells":
+      return { action: "handled", output: { title: "background shells", body: jobsBody() } };
+    case "quit":
+    case "exit":
+    case "q":
+      return { action: "quit" };
     default:
-      console.log(pc.red(`  unknown command: /${cmd}`));
-      printHelp();
-      return true;
+      return {
+        action: "handled",
+        output: { title: `unknown command: /${cmd}`, body: HELP_BODY, tone: "error" },
+      };
   }
 }
 
-function printHelp(): void {
-  console.log(pc.bold("\n  commands:"));
-  for (const [name, desc] of HELP) {
-    console.log(`    ${pc.cyan(name.padEnd(8))} ${pc.dim(desc)}`);
-  }
-}
-
-function printTools(ctx: CommandContext): void {
-  console.log(pc.bold("\n  built-in:"));
-  console.log(pc.dim("    " + Object.keys(builtinTools).join(", ")));
+function toolsBody(ctx: CommandContext): string {
+  const lines = [`built-in: ${Object.keys(builtinTools).join(", ")}`];
   const mcp = ctx.mcpServers.flatMap((s) => s.tools);
-  if (mcp.length) {
-    console.log(pc.bold("  mcp:"));
-    console.log(pc.dim("    " + mcp.join(", ")));
-  }
+  if (mcp.length) lines.push(`mcp: ${mcp.join(", ")}`);
+  return lines.join("\n");
 }
 
-function printMcp(ctx: CommandContext): void {
-  if (ctx.mcpServers.length === 0) {
-    console.log(
-      pc.dim(
-        "\n  no MCP servers configured. Add ~/.iota/mcp.json or <project>/.iota/mcp.json"
-      )
-    );
-    return;
+function jobsBody(): string {
+  const shells = listShells();
+  if (shells.length === 0) {
+    return "No background shells. Start one with bash(background=true).";
   }
-  console.log("");
+  return shells
+    .map((s) => {
+      const status =
+        s.status === "running" ? "running" : `${s.status} (exit ${s.exitCode})`;
+      return `${s.id}  [${status}]  ${s.command}`;
+    })
+    .join("\n");
+}
+
+function mcpBody(ctx: CommandContext): string {
+  if (ctx.mcpServers.length === 0) {
+    return "No MCP servers configured. Add one with: iota mcp add …";
+  }
+  const lines: string[] = [];
   for (const s of ctx.mcpServers) {
-    const tag = s.trusted ? pc.green(" (trusted)") : "";
+    const tag = s.trusted ? " (trusted)" : "";
     if (s.error) {
-      console.log(pc.bold(`  ${s.name}`) + tag + pc.red(`  ✗ ${s.error}`));
+      lines.push(`${s.name}${tag}  ✗ ${s.error}`);
       continue;
     }
-    console.log(pc.bold(`  ${s.name}`) + tag + pc.dim(`  ${s.tools.length} tool(s)`));
-    for (const t of s.tools) console.log(pc.dim(`    - ${t}`));
+    lines.push(`${s.name}${tag}  ${s.tools.length} tool(s)`);
+    for (const t of s.tools) lines.push(`  - ${t}`);
   }
+  return lines.join("\n");
 }

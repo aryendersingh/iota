@@ -5,7 +5,7 @@ import { glob } from "glob";
 import { z } from "zod";
 import { createTool } from "@mastra/core/tools";
 import { runtime } from "./runtime.js";
-import * as ui from "./ui/render.js";
+import { startShell, readShell, killShell } from "./shells.js";
 
 /**
  * Across Mastra versions, execute has received its validated input either
@@ -26,15 +26,17 @@ interface Def<A> {
   description: string;
   risk?: Risk;
   schema: z.ZodType<A>;
-  summarize: (a: A) => string;
+  /** Short argument summary shown next to the tool name, e.g. the path/command. */
+  detail: (a: A) => string;
   /** allowlist key for "always"; defaults to the tool id */
   permKey?: (a: A) => string;
   run: (a: A) => Promise<string>;
 }
 
 /**
- * Wrap shared concerns once: print a banner, gate dangerous calls through the
- * permission manager, run, preview the result, and never throw out of the loop.
+ * Wrap shared concerns once: emit a tool-start event, gate dangerous calls
+ * through the permission manager, run, report the result, and never throw out
+ * of the loop. All UI goes through `runtime.ui` (never stdout directly).
  */
 function defineTool<A>(def: Def<A>) {
   return createTool({
@@ -44,23 +46,24 @@ function defineTool<A>(def: Def<A>) {
     outputSchema: z.object({ result: z.string() }),
     execute: async (raw: any) => {
       const args = readInput<A>(raw);
-      ui.renderToolCall(def.summarize(args));
+      const detail = def.detail(args);
+      const id = runtime.ui.toolStart(def.id, detail);
 
       if (def.risk === "dangerous") {
         const key = def.permKey ? def.permKey(args) : def.id;
-        if (!(await runtime.permissions.check(key, def.summarize(args)))) {
-          ui.renderError("Denied by user.");
+        if (!(await runtime.permissions.check(key, `${def.id}(${detail})`))) {
+          runtime.ui.toolEnd(id, "error", "Denied by user.");
           return { result: "User denied permission to run this tool." };
         }
       }
 
       try {
         const result = await def.run(args);
-        ui.renderToolResult(result, false);
+        runtime.ui.toolEnd(id, "done", result);
         return { result };
       } catch (e: any) {
         const msg = e?.message ?? String(e);
-        ui.renderToolResult(msg, true);
+        runtime.ui.toolEnd(id, "error", msg);
         return { result: `Error: ${msg}` };
       }
     },
@@ -75,7 +78,7 @@ const readTool = defineTool({
     offset: z.number().int().optional().describe("1-based line to start from."),
     limit: z.number().int().optional().describe("Maximum number of lines."),
   }),
-  summarize: (a) => `read(${a.path})`,
+  detail: (a) => a.path,
   async run(a) {
     const data = await fs.readFile(resolvePath(a.path), "utf8");
     const lines = data.split("\n");
@@ -98,7 +101,7 @@ const writeTool = defineTool({
     path: z.string().describe("File path to write."),
     content: z.string().describe("Full contents to write."),
   }),
-  summarize: (a) => `write(${a.path})`,
+  detail: (a) => a.path,
   async run(a) {
     const abs = resolvePath(a.path);
     await fs.mkdir(path.dirname(abs), { recursive: true });
@@ -118,7 +121,7 @@ const editTool = defineTool({
     new_string: z.string().describe("Replacement text."),
     replace_all: z.boolean().optional().describe("Replace every occurrence."),
   }),
-  summarize: (a) => `edit(${a.path})`,
+  detail: (a) => a.path,
   async run(a) {
     const abs = resolvePath(a.path);
     const data = await fs.readFile(abs, "utf8");
@@ -140,20 +143,37 @@ const MAX_OUTPUT = 30000;
 
 const bashTool = defineTool({
   id: "bash",
-  description: "Run a shell command in the working directory and return its output.",
+  description:
+    "Run a shell command in the working directory. By default waits for it to finish and returns its output. Set background=true for long-running commands (servers, watchers) to start it and return immediately with a bash_id you can poll via bash_output and stop via kill_shell.",
   risk: "dangerous",
   schema: z.object({
     command: z.string().describe("Shell command to run."),
-    timeout_ms: z.number().int().optional().describe("Timeout in ms (default 120000)."),
+    timeout_ms: z.number().int().optional().describe("Timeout in ms (default 120000). Ignored when background."),
+    background: z
+      .boolean()
+      .optional()
+      .describe("Run detached and return immediately with a bash_id (no timeout)."),
   }),
-  summarize: (a) => `bash(${a.command})`,
+  detail: (a) => (a.background ? `${a.command}  (background)` : a.command),
   permKey: (a) => `bash:${a.command.trim().split(/\s+/)[0] ?? ""}`,
   run(a) {
+    if (a.background) {
+      const id = startShell(a.command, runtime.cwd);
+      return Promise.resolve(
+        `Started background shell ${id}: ${a.command}\n` +
+          `Poll output with bash_output(bash_id="${id}"); stop it with kill_shell(bash_id="${id}").`
+      );
+    }
+    const timeoutMs = a.timeout_ms ?? 120000;
     return new Promise<string>((resolve, reject) => {
       const child = spawn(a.command, { cwd: runtime.cwd, shell: true });
       let out = "";
       let err = "";
-      const timer = setTimeout(() => child.kill("SIGKILL"), a.timeout_ms ?? 120000);
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, timeoutMs);
       child.stdout?.on("data", (d) => (out += d.toString()));
       child.stderr?.on("data", (d) => (err += d.toString()));
       child.on("error", (e) => {
@@ -165,6 +185,14 @@ const bashTool = defineTool({
         let body = out + (err ? (out ? "\n" : "") + err : "");
         body = body.trim() || "(no output)";
         if (body.length > MAX_OUTPUT) body = body.slice(0, MAX_OUTPUT) + "\n... (truncated)";
+        if (timedOut) {
+          resolve(
+            `Command timed out after ${Math.round(timeoutMs / 1000)}s and was killed. ` +
+              `If this is a long-running process (e.g. a dev server), re-run it with ` +
+              `background=true instead of foreground.\n${body}`
+          );
+          return;
+        }
         resolve(`exit code: ${code}\n${body}`);
       });
     });
@@ -189,7 +217,7 @@ const grepTool = defineTool({
     path: z.string().optional().describe("Directory or file to search (default cwd)."),
     glob: z.string().optional().describe("Only search files matching this glob."),
   }),
-  summarize: (a) => `grep(${a.pattern})`,
+  detail: (a) => a.pattern,
   async run(a) {
     const searchPath = resolvePath(a.path ?? ".");
     if (await hasRipgrep()) {
@@ -238,7 +266,7 @@ const globTool = defineTool({
     pattern: z.string().describe("Glob pattern, e.g. src/**/*.ts"),
     path: z.string().optional().describe("Base directory (default cwd)."),
   }),
-  summarize: (a) => `glob(${a.pattern})`,
+  detail: (a) => a.pattern,
   async run(a) {
     const matches = await glob(a.pattern, {
       cwd: resolvePath(a.path ?? "."),
@@ -255,7 +283,7 @@ const lsTool = defineTool({
   schema: z.object({
     path: z.string().optional().describe("Directory to list (default cwd)."),
   }),
-  summarize: (a) => `ls(${a.path ?? "."})`,
+  detail: (a) => a.path ?? ".",
   async run(a) {
     const entries = await fs.readdir(resolvePath(a.path ?? "."), { withFileTypes: true });
     const formatted = entries
@@ -265,12 +293,45 @@ const lsTool = defineTool({
   },
 });
 
+const bashOutputTool = defineTool({
+  id: "bash_output",
+  description:
+    "Read new output from a background shell (started with bash background=true) since the last read, plus its status.",
+  schema: z.object({
+    bash_id: z.string().describe("The id returned by bash(background=true)."),
+  }),
+  detail: (a) => a.bash_id,
+  async run(a) {
+    const r = readShell(a.bash_id);
+    if (!r.ok) return r.error!;
+    const status =
+      r.status === "running" ? "running" : `${r.status} (exit ${r.exitCode})`;
+    const out = r.output && r.output.length ? r.output : "(no new output)";
+    return `[${a.bash_id}] ${status}\n${out}`;
+  },
+});
+
+const killShellTool = defineTool({
+  id: "kill_shell",
+  description: "Stop a background shell started with bash(background=true).",
+  schema: z.object({
+    bash_id: z.string().describe("The id of the background shell to stop."),
+  }),
+  detail: (a) => a.bash_id,
+  async run(a) {
+    const r = killShell(a.bash_id);
+    return r.ok ? `Killed ${a.bash_id}` : r.error!;
+  },
+});
+
 /** Keyed object passed to the Agent; keys become the tool names the model sees. */
 export const tools = {
   read: readTool,
   write: writeTool,
   edit: editTool,
   bash: bashTool,
+  bash_output: bashOutputTool,
+  kill_shell: killShellTool,
   grep: grepTool,
   glob: globTool,
   ls: lsTool,

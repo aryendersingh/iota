@@ -1,27 +1,26 @@
 #!/usr/bin/env node
+import { createElement } from "react";
 import { loadConfig } from "./config.js";
 import { loadContext } from "./context.js";
 import { loadMcpConfig, connectMcp } from "./mcp.js";
 import { runMcpCli } from "./mcp-cli.js";
 import { buildAgent } from "./agent.js";
 import { runtime } from "./runtime.js";
-import { startRepl } from "./repl.js";
+import { listShells, onShellsChange, killAll } from "./shells.js";
+import { createSession, runHeadless } from "./session.js";
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
 
-  // Subcommands (e.g. `iota mcp add …`) run and exit instead of starting the REPL.
+  // Subcommands (e.g. `iota mcp add …`) run and exit instead of starting a session.
   if (argv[0] === "mcp") {
     process.exit(await runMcpCli(argv.slice(1)));
   }
 
   const config = loadConfig(argv);
-
-  // Populate the shared runtime that tools read from at execution time.
   runtime.cwd = config.cwd;
   runtime.permissions.setSkipAll(config.yolo);
 
-  // Build the system prompt from default + AGENTS.md/CLAUDE.md/SYSTEM.md.
   const context = loadContext(config.cwd);
 
   // Connect any configured MCP servers and merge their tools.
@@ -37,9 +36,41 @@ async function main(): Promise<void> {
   }
 
   const agent = buildAgent(config, context.systemPrompt, mcp?.tools ?? {});
+  const mcpServers = mcp?.servers ?? [];
+
   try {
-    await startRepl(agent, config, context.files, mcp?.servers ?? []);
+    if (process.stdin.isTTY) {
+      // Interactive Ink TUI.
+      const { store } = await import("./ui/store.js");
+      const { App } = await import("./ui/app.js");
+      const { render } = await import("ink");
+
+      store.init(config.model, config.thread);
+      runtime.ui = store;
+      runtime.permissions.setRequester((summary) => store.requestPermission(summary));
+      onShellsChange(() => store.setShells(listShells()));
+
+      const session = createSession(agent, config, mcpServers);
+      const mcpToolCount = mcpServers.reduce((n, s) => n + s.tools.length, 0);
+      const header = {
+        model: config.model,
+        thread: config.thread,
+        context: context.files.join(", ") || undefined,
+        mcp: mcpToolCount
+          ? `mcp: ${mcpToolCount} tool(s) across ${mcpServers.length} server(s)`
+          : undefined,
+      };
+
+      const app = render(createElement(App, { session, header }), {
+        exitOnCtrlC: false,
+      });
+      await app.waitUntilExit();
+    } else {
+      // Non-TTY (pipes/CI): plain-text fallback.
+      await runHeadless(agent, config, mcpServers);
+    }
   } finally {
+    killAll();
     await mcp?.client.disconnect();
   }
 }

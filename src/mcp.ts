@@ -3,7 +3,6 @@ import os from "node:os";
 import path from "node:path";
 import { MCPClient } from "@mastra/mcp";
 import { runtime } from "./runtime.js";
-import * as ui from "./ui/render.js";
 
 /**
  * MCP (Model Context Protocol) support. Servers are declared in JSON, connected
@@ -93,26 +92,26 @@ export function loadMcpConfig(cwd: string): {
   return { servers: merged, sources };
 }
 
-/** Wrap an MCP tool's execute with a banner + permission gate (in place). */
+/** Wrap an MCP tool's execute with a UI event + permission gate (in place). */
 function gate(name: string, tool: any, trusted: boolean): unknown {
   const orig = tool?.execute?.bind(tool);
   if (!orig) return tool;
   tool.execute = async (...callArgs: any[]) => {
     const input = readInput(callArgs[0]);
-    ui.renderToolCall(`${name}(${preview(input)})`);
+    const id = runtime.ui.toolStart(name, preview(input));
     if (!trusted) {
       const ok = await runtime.permissions.check(`mcp:${name}`, `${name} ${preview(input)}`);
       if (!ok) {
-        ui.renderError("Denied by user.");
+        runtime.ui.toolEnd(id, "error", "Denied by user.");
         throw new Error("User denied permission to run this MCP tool.");
       }
     }
     try {
       const out = await orig(...callArgs);
-      ui.renderToolResult(typeof out === "string" ? out : JSON.stringify(out), false);
+      runtime.ui.toolEnd(id, "done", typeof out === "string" ? out : JSON.stringify(out));
       return out;
     } catch (e: any) {
-      ui.renderToolResult(e?.message ?? String(e), true);
+      runtime.ui.toolEnd(id, "error", e?.message ?? String(e));
       throw e;
     }
   };
@@ -138,7 +137,7 @@ export async function connectMcp(
     } else if (cfg.command) {
       defs[name] = { command: cfg.command, args: cfg.args ?? [], env: cfg.env };
     } else {
-      ui.renderError(`MCP server '${name}' has neither command nor url; skipping.`);
+      console.error(`  MCP server '${name}' has neither command nor url; skipping.`);
     }
   }
 
@@ -160,7 +159,7 @@ export async function connectMcp(
   }
 
   for (const [server, message] of Object.entries(errors ?? {})) {
-    ui.renderError(`MCP server '${server}' failed: ${message}`);
+    console.error(`  MCP server '${server}' failed: ${message}`);
     serverInfos.push({ name: server, trusted: trusted.has(server), tools: [], error: message });
   }
 
